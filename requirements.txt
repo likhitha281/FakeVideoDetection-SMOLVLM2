@@ -1,0 +1,15 @@
+# Core
+torch>=2.1
+transformers>=4.45
+accelerate
+peft
+safetensors
+
+# Data / media
+Pillow
+huggingface_hub
+decord            # only needed for training/finetune_lora_video_based.py (video decoding);
+                   # not required for the frames-based pipeline
+
+# Utilities
+tqdm

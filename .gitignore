@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# Checkpoints / model weights (large, regenerable — not committed)
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+
+# Data (regenerable from the HF dataset via the precompute pipeline)
+exddv_frames/
+*.mp4
+*.flv
+
+# Secrets — never commit tokens/keys
+.env
+*.token
+
+# Logs / notebooks scratch
+*.log
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

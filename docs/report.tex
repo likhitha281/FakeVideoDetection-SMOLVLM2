@@ -1,0 +1,670 @@
+\documentclass[acmsmall,review=false]{acmart}
+
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\setcopyright{none}
+\acmConference{}{}{}
+\acmYear{2026}
+\acmDOI{}
+\acmISBN{}
+\pagestyle{plain}
+
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{url}
+
+\title{Detecting Deepfake Videos with Vision-Language Models: An Application of SmolVLM2}
+
+\author{Likhitha Sindhu Geddam}
+\affiliation{%
+  \institution{Research Internship, IIIT Bangalore}
+  \country{India}
+}
+
+\begin{document}
+
+\begin{abstract}
+Deepfake video detection systems are typically trained as opaque binary
+classifiers, producing a real/fake verdict without any indication of \emph{why}
+that verdict was reached. This lack of explainability limits their usefulness
+in settings where a human still needs to verify or act on the model's output.
+This report describes the fine-tuning of a compact vision-language model,
+SmolVLM2-256M-Instruct~\citep{marafioti2025smolvlm}, into a multi-task deepfake
+detector that jointly predicts a real/fake label and generates a natural-language
+description of the visual artifacts supporting that prediction. The model is
+adapted using Low-Rank Adaptation (LoRA)~\citep{hu2021lora} on both the attention
+and feed-forward projections of the language backbone, alongside a lightweight
+classification head and a contrastive vision-text alignment objective. Training
+data is drawn from a compilation of established deepfake benchmarks, including
+FaceForensics++~\citep{rossler2019faceforensics}, Celeb-DF~\citep{li2020celebdf},
+and CREMA-D~\citep{cao2014cremad}. We report the engineering pipeline used to make
+training feasible under a constrained compute and storage budget, how the
+dataset's natural real/fake class imbalance is addressed in the classification
+loss, and preliminary classification and generation results.
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+
+The rapid advancement of generative AI tools has significantly lowered the
+barrier to creating convincing deepfake videos, placing capabilities once
+limited to specialized research groups into the hands of casual users. The
+resulting circulation of such content online poses serious challenges,
+including the spread of misinformation, reputational harm, and an erosion of
+trust in visual media as reliable evidence~\citep{hondru2025exddv}. Most
+deepfake videos fall into one of a few manipulation categories --- identity
+swapping, expression reenactment, or fully AI-synthesized generation --- each
+leaving behind subtle but distinct visual traces~\citep{rossler2019faceforensics}.
+
+This project takes a different approach to detecting such videos. Rather than
+treating detection as a purely binary classification problem, as the majority
+of existing deepfake detectors do~\citep{li2020celebdf}, we fine-tune SmolVLM2,
+a compact vision-language model, to both classify a video as real or fake
+\emph{and} generate a concise natural-language explanation of the specific
+visual artifacts supporting that decision --- describing inconsistencies in
+texture, lighting, eye movement, facial motion, or boundary edges around the
+face. This gives a human reviewer something actionable to verify, rather than
+a bare label with no justification.
+
+SmolVLM2 was chosen specifically for this task because it is designed to be
+lightweight and computationally efficient: at only 256 million parameters, it
+is built to run in resource-constrained settings where larger vision-language
+models are impractical~\citep{marafioti2025smolvlm}. This made it a natural fit
+for a project explicitly aimed at establishing whether a multi-task
+detection-and-explanation model could be trained and run without requiring
+large-scale computing infrastructure.
+
+The remainder of this report is organized as follows. Section~\ref{sec:related}
+reviews related work on deepfake detection datasets, explainability, and
+parameter-efficient fine-tuning. Section~\ref{sec:dataset} describes the
+training data, including a class-imbalance issue discovered and corrected
+during the project. Section~\ref{sec:method} describes the model architecture
+and multi-task training objective. Section~\ref{sec:infra} documents the
+training infrastructure and engineering challenges encountered.
+Section~\ref{sec:results} reports experimental results, and
+Section~\ref{sec:conclusion} concludes.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Deepfake Detection Datasets}
+
+FaceForensics++~\citep{rossler2019faceforensics} is among the most widely used
+benchmarks for facial forgery detection, comprising 1,000 real videos sourced
+from YouTube, each manipulated using four representative techniques: DeepFakes,
+Face2Face, FaceSwap, and NeuralTextures, spanning both identity-swap and
+expression-reenactment manipulation families. Celeb-DF~\citep{li2020celebdf}
+was introduced specifically to address a visual-quality gap in earlier
+datasets: its authors observed that deepfakes circulating in the wild were
+substantially higher quality than those in existing benchmarks, and released
+5,639 refined DeepFake videos of celebrities to better reflect this. Both
+datasets remain standard training and evaluation sources for forgery detection
+research. CREMA-D~\citep{cao2014cremad}, while not itself a deepfake dataset,
+is a widely used audio-visual corpus of emotionally expressive facial and vocal
+recordings from 91 actors, and is used in this project as a source of diverse,
+naturalistic real facial video content.
+
+\subsection{Explainable Deepfake Detection}
+
+\citet{hondru2025exddv} introduce ExDDV, the first dataset explicitly designed
+for explainable deepfake video detection, pairing roughly 5.4K real and fake
+videos with human-written textual artifact descriptions and spatial click
+annotations localizing the described artifacts. Their experiments, which
+fine-tune and in-context-prompt several vision-language models, find that
+combining textual and spatial supervision is necessary to obtain models capable
+of both localizing and describing observed artifacts, and that description
+quality alone (without spatial grounding) remains a meaningful challenge for
+current models. This motivates our decision to frame artifact explanation as a
+learned generative task rather than a post-hoc justification step, while
+acknowledging that our setup, lacking spatial click supervision, targets a
+strictly text-only variant of this explainability goal.
+
+\subsection{Parameter-Efficient Fine-Tuning}
+
+Adapting large pretrained models to a downstream task traditionally requires
+updating all model parameters, which is memory- and compute-intensive and
+produces a full-size checkpoint per task. \citet{hu2021lora} propose Low-Rank
+Adaptation (LoRA), which freezes the pretrained weight matrices and instead
+learns a pair of low-rank matrices whose product is added to each targeted
+weight matrix at inference time. Because the rank of these matrices is chosen
+to be much smaller than the original matrix dimensions, the number of trainable
+parameters is reduced by orders of magnitude relative to full fine-tuning, while
+empirically retaining competitive downstream performance. This project applies
+LoRA to both the attention projections (query, key, value, output) and the
+feed-forward projections (gate, up, down) of the SmolVLM2 language backbone,
+while keeping the vision encoder frozen and the multimodal connector and
+task-specific heads fully trainable.
+
+\subsection{Compact Vision-Language Models}
+
+\citet{marafioti2025smolvlm} introduce the SmolVLM family, a set of
+vision-language models explicitly engineered for resource-efficient inference,
+released at 256M, 500M, and 2.2B parameter scales. The authors report that
+architectural choices around visual tokenization and data curation allow even
+their smallest 256M-parameter variant to outperform substantially larger prior
+models on a memory-normalized basis, making it a practical backbone for
+on-device or low-resource fine-tuning scenarios such as this one. SmolVLM2
+extends this family with native video understanding, processing a sequence of
+sampled frames as an interleaved image sequence, which is the mechanism this
+project relies on for temporal (multi-frame) input.
+
+\section{Dataset}
+\label{sec:dataset}
+
+\subsection{Composition}
+
+The training corpus is compiled from multiple established sources described
+above --- FaceForensics++, Celeb-DF, and CREMA-D --- combined with additional
+AI-generated fake content, and hosted as a private dataset repository on the
+Hugging Face Hub.\footnote{\url{https://huggingface.co/datasets/LikhithaGeddam/fakevideodetection-private}}
+Each video is labeled \texttt{real} or \texttt{fake} and organized into
+\texttt{train}, \texttt{val}, and \texttt{test} splits. Table~\ref{tab:splits}
+gives the per-split class counts.
+
+\begin{table}[h]
+\centering
+\caption{Dataset split composition by class.}
+\label{tab:splits}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Split} & \textbf{Real} & \textbf{Fake} & \textbf{Total} \\
+\midrule
+Train & 6,532 & 9,634 & 16,166 \\
+Val   & 1,400 & 1,904 & 3,304 \\
+Test  & 1,400 & 2,065 & 3,465 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Caption Generation and Class Weighting}
+
+To supervise the natural-language explanation task, each training video
+requires an associated artifact description. Captions were generated by
+running a pretrained deepfake detection model
+(\texttt{prithivMLmods/Deep-Fake-Detector-v2-Model}, a Vision Transformer-based
+classifier) over sampled frames of each video, recording its prediction,
+per-frame confidence, and an attention-rollout-derived description of the
+facial region most responsible for the prediction. This process was run to
+completion across the full training pool, giving all 6,532 real and all 9,634
+fake training videos (Table~\ref{tab:splits}) a detector-derived caption, with
+uniform coverage across both classes.
+
+Although caption coverage is complete and uniform, the underlying video corpus
+is itself class-imbalanced: the training split is 40.4\% real and 59.6\% fake
+by video count (Table~\ref{tab:splits}). Left unaddressed, this imbalance
+could let the classification head partially rely on the class prior rather
+than learning a genuine decision boundary. To correct for this, the
+classification loss uses a dataset-level fixed class weight computed once
+from the true training-set class counts, rather than a per-batch reweighting
+scheme whose effective weighting can vary with the specific class composition
+of each mini-batch. This fixed weighting is applied identically at every
+training step regardless of batch composition (Section~\ref{sec:method}).
+
+\section{Multimodal Signal Design}
+\label{sec:signal}
+
+Before describing the model architecture in detail (Section~\ref{sec:method}),
+we summarize the multimodal signal the system is built around: what features
+it detects on, how inputs are constructed, and how the two modalities are
+represented and fused.
+
+\paragraph{Features used for detection.} The model does not use any hand-designed
+artifact detector. Instead, visual artifacts (compositing boundaries,
+texture/lighting inconsistencies, unnatural motion) are learned implicitly by
+the vision encoder and connector, supervised jointly by (i) a binary real/fake
+classification signal and (ii) natural-language artifact descriptions that
+name the specific inconsistency observed (Section~\ref{sec:dataset}). No audio,
+transcript, or external metadata signal is used --- the system is
+visual-and-caption-only.
+
+\paragraph{Input construction.} Each training example consists of a fixed
+number of frames sampled per video clip (stratified temporal sampling with
+random jitter, Section~\ref{sec:method}), paired with a text prompt requesting
+a real/fake judgment and explanation, and a target text sequence containing
+the ground-truth label and artifact description. No face-cropping or alignment
+preprocessing is applied; frames are passed to the vision encoder at their
+sampled resolution and the model must localize any facial region itself.
+
+\paragraph{Input representation and fusion.} Frames are tokenized by the
+SigLIP-based vision encoder and projected into the language model's embedding
+space by a pixel-shuffle connector, then interleaved with text tokens as a
+single sequence --- an image-text pair representation rather than a separate
+late-fusion classifier. Classification and contrastive alignment
+(Section~\ref{sec:method}) both operate on the same connector output captured
+via a forward hook during this single forward pass, rather than a second,
+detached vision pass; this makes the fusion embedding-level rather than
+decision-level (late) fusion, since the classification decision is read
+directly off the fused visual representation rather than combined post-hoc
+with a separate text-based decision.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Backbone Architecture}
+
+The base model is SmolVLM2-256M-Instruct~\citep{marafioti2025smolvlm}, comprising
+a SigLIP-based vision encoder, a pixel-shuffle connector projecting visual
+features into the language model's embedding space, and a SmolLM2-derived causal
+language decoder. For video input, a fixed number of frames are sampled per clip
+using stratified temporal sampling with a small random jitter, encouraging
+coverage across the full clip duration while retaining some sampling diversity
+across epochs.
+
+\subsection{Multi-Task Heads}
+
+On top of the shared backbone, we attach two lightweight task-specific heads:
+
+\begin{itemize}[nosep]
+    \item \textbf{Classification head}: a two-layer MLP (576 $\rightarrow$ 512
+    $\rightarrow$ 2, with ReLU and dropout) applied to the mean-pooled visual
+    connector output, producing a real/fake logit pair.
+    \item \textbf{Contrastive alignment head}: linear projections of the pooled
+    visual features and the final-token text hidden state into a shared
+    256-dimensional embedding space, trained with a symmetric InfoNCE-style
+    contrastive loss (temperature $= 0.07$) to encourage visual and textual
+    representations of the same video to align.
+\end{itemize}
+
+A key implementation detail is that both auxiliary heads consume visual
+features captured via a forward hook on the connector module \emph{during} the
+same forward pass used for language modeling, rather than via a second,
+gradient-detached vision encoder pass. This ensures classification and
+contrastive gradients propagate back through the connector (and, when unfrozen,
+the vision encoder), rather than being computed on frozen, non-differentiable
+features --- a design choice made after observing that a detached-feature
+variant caused the auxiliary losses to plateau early without meaningfully
+shaping the visual representation.
+
+\subsection{Parameter-Efficient Adaptation}
+
+Rather than fine-tuning all backbone parameters, we apply LoRA
+\citep{hu2021lora} (rank 32, $\alpha=64$) to the query, key, value, and output
+attention projections as well as the gate, up, and down feed-forward
+projections of the language decoder. The vision encoder is frozen; the
+multimodal connector and both task heads remain fully trainable. This
+configuration was chosen to balance adaptation capacity against the
+overfitting risk and compute cost of full fine-tuning on a moderately sized
+video corpus.
+
+\subsection{Training Objective}
+
+The total training loss is a weighted combination of three terms:
+\begin{equation}
+\mathcal{L} = \lambda_{\text{cls}} \mathcal{L}_{\text{cls}} + \lambda_{\text{lm}} \mathcal{L}_{\text{lm}} + \lambda_{\text{contr}}(t) \, \mathcal{L}_{\text{contr}}
+\end{equation}
+where $\mathcal{L}_{\text{cls}}$ is class-weighted cross-entropy on the
+real/fake prediction (weights computed once from full training-set class
+counts, per Section~\ref{sec:dataset}), $\mathcal{L}_{\text{lm}}$ is the
+standard causal language-modeling loss on the generated explanation text (with
+the prompt/header tokens masked out of the loss via direct token-ID
+matching of the assistant turn boundary), and $\mathcal{L}_{\text{contr}}$ is
+the contrastive alignment loss described above, whose weight $\lambda_{\text{contr}}(t)$
+is ramped linearly from zero over the first portion of training rather than
+applied at full strength from step one, since a very small effective batch
+size gives an unreliable pool of contrastive negatives early in training. A
+label-smoothing term ($\epsilon = 0.05$) is applied to the classification loss.
+
+\section{Training Infrastructure}
+\label{sec:infra}
+
+Beyond the modeling choices above, a substantial portion of this project
+involved making training \emph{feasible at all} under real-world resource
+constraints, which we document here as it materially affected the scope and
+schedule of experiments.
+
+\subsection{Storage-Constrained Data Access}
+
+The full video corpus, at native resolution, exceeds the available local
+storage in a free-tier cloud notebook environment (Google Colab) by roughly an
+order of magnitude, so storing or repeatedly re-downloading raw video was not
+viable. We addressed this with a two-stage, precompute-then-train pipeline
+rather than reading video directly during training:
+
+\begin{enumerate}[nosep]
+    \item \textbf{One-time frame precomputation}: a separate script
+    (\texttt{precompute\_frames\_streaming.py}) streams each video once from
+    the Hugging Face Hub-hosted dataset repository (Section~\ref{sec:dataset}),
+    extracts a fixed pool of 8 frames per video, and writes them to local disk
+    as JPEGs under a \texttt{split/\{real,fake\}/<video\_stem>/} directory
+    structure, together with \texttt{train}/\texttt{val}/\texttt{test} JSON
+    manifests that reference frame paths rather than a video path. The source
+    video is not retained after its frames are extracted.
+    \item \textbf{Frames-only training}: the training script reads exclusively
+    from this precomputed frame pool and never touches a video file or a video
+    decoding library. \texttt{VideoFakeClueDatasetFrames} loads the relevant
+    JPEGs directly with PIL, so the \texttt{decord}-based video decoding used
+    in earlier iterations of the pipeline is removed entirely from the
+    training path.
+\end{enumerate}
+
+Because only JPEG frames are stored rather than full videos, this keeps the
+persistent disk footprint under 10\,GB, well within a free-tier notebook
+environment's budget, without needing per-video Hub streaming during training
+itself. Per-epoch sampling variety is preserved despite frames being extracted
+only once: each \texttt{\_\_getitem\_\_} call still selects a jittered subset
+of \texttt{num\_frames} (4, by default) from the saved 8-frame pool and applies
+random flip/brightness augmentation, so the same video contributes a
+different, augmented frame subset on different epochs even though the
+underlying JPEGs on disk are fixed. Before training begins, a resolution check
+verifies that every entry's referenced frame files are actually present on
+disk, reporting any gap as an explicit count and percentage rather than
+silently degrading data quality with placeholder frames.
+
+\subsection{Checkpointing and Fault Tolerance}
+
+Because training runs extend over many hours on infrastructure subject to
+session timeouts, disconnects, and preemption, checkpointing was treated as a
+first-class concern rather than an afterthought. Model, optimizer, and
+scheduler state are checkpointed to persistent storage at the end of every
+epoch, and training can resume from an arbitrary checkpoint rather than
+restarting. A separate, continuously-updated ``best'' checkpoint is maintained
+based on held-out classification accuracy (Section~\ref{sec:results}),
+independent of the most recent epoch checkpoint, so that a partially-completed
+or subsequently-degraded epoch does not overwrite the best model observed so
+far.
+
+\subsection{Reproducibility Under a Changing Environment}
+
+A secondary, less anticipated challenge was environment drift: the training
+script was, at different points, affected by a background library update
+(\texttt{transformers}) that removed a previously-standard training argument
+in a major version release. Rather than pin a single environment version
+indefinitely, the training script was made defensive to this class of failure:
+it inspects the installed library's accepted arguments at runtime and
+translates or drops unsupported configuration values with an explicit warning,
+rather than failing on an unrecognized keyword argument mid-run.
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\begin{table}[h]
+\centering
+\caption{Key training hyperparameters.}
+\label{tab:hparams}
+\begin{tabular}{ll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} \\
+\midrule
+Base model & SmolVLM2-256M-Instruct \\
+LoRA rank / $\alpha$ & 32 / 64 \\
+LoRA target modules & q,k,v,o\_proj, gate,up,down\_proj \\
+Frames per clip & 4--6 (stratified + jitter) \\
+Per-device batch size & 4 \\
+Gradient accumulation steps & 2--4 \\
+Effective batch size & 8--16 \\
+Optimizer & AdamW ($\beta_1{=}0.9$, $\beta_2{=}0.999$) \\
+Peak learning rate & $5\times10^{-5}$ \\
+LR schedule & Cosine, with warmup \\
+Precision & bfloat16 \\
+Epochs & 3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Head parameters (classification and contrastive heads) are trained at a higher
+relative learning rate than the base LoRA parameters, reflecting that these
+components are randomly initialized and have no pretrained prior to preserve.
+The dataset's pre-defined \texttt{val} split (3,304 videos, disjoint from the
+training videos actually seen by the optimizer; Table~\ref{tab:splits}) is used
+to track real/fake classification accuracy at the end of every epoch,
+independent of the training-batch accuracy logged during optimization, which
+we found could be misleadingly high on individual batches without reflecting
+genuine generalization.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Classification Performance}
+
+Classification metrics below were obtained by reloading each epoch's saved
+checkpoint (\texttt{checkpoint-910}, \texttt{checkpoint-1820}, and
+\texttt{checkpoint-2730}, corresponding to epochs 1--3) and evaluating on a
+stratified subsample of 400 videos drawn from the validation split (166 real,
+234 fake), preserving the split's original class ratio. This post-hoc
+evaluation was necessary because the training-time validation callback only
+logged accuracy to console output rather than persisting it, and did not
+compute per-class precision/recall at all; the callback has since been
+extended to log all three metrics to disk for future runs.
+
+\begin{table}[h]
+\centering
+\caption{Validation classification performance by epoch (stratified 400-video subsample of the validation split).}
+\label{tab:results}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Epoch} & \textbf{Accuracy} & \textbf{Precision (real)} & \textbf{Recall (real)} \\
+\midrule
+1 & 91.8\% & 99.3\% & 80.7\% \\
+2 & 91.5\% & 97.1\% & 81.9\% \\
+3 & 91.8\% & 98.5\% & 81.3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Given the class imbalance documented in Section~\ref{sec:dataset}, we report
+precision and recall for the minority (real) class specifically, rather than
+overall accuracy alone, since overall accuracy can be misleadingly high on an
+imbalanced split even for a classifier that has not learned a meaningful
+decision boundary. Precision on the real class stays consistently above 97\%
+across all three epochs, indicating the model rarely misclassifies a fake
+video as real; recall plateaus around 81\%, indicating roughly one in five
+real videos is still misclassified as fake. Accuracy, precision, and recall
+are all essentially flat across epochs 1--3, suggesting the classification
+head converges early and additional epochs primarily benefit the
+explanation-generation objective rather than the classification objective.
+
+\subsection{Ablation Studies}
+\label{sec:ablations}
+
+We ran three ablations against a matched baseline, each isolating one design
+choice: (i) \emph{single\_frame}, sampling 1 frame per clip instead of 4, to
+test the contribution of temporal information; (ii) \emph{no\_contrastive},
+setting the contrastive vision-text alignment weight to 0 instead of its
+ramped schedule (Section~\ref{sec:method}), to test the contribution of the
+alignment objective; and (iii) \emph{lower\_lr}, a peak learning rate of
+$1\times10^{-5}$ instead of $5\times10^{-5}$. Because a full 3-epoch run per
+variant is not feasible on a single Colab GPU, all four runs (including the
+baseline) use a fixed, short 350-step budget with a freshly initialized model,
+and are evaluated on the same stratified 200-video subsample of the validation
+split (identical across variants, disjoint from the subsamples used in
+Table~\ref{tab:results}).
+
+\begin{table}[h]
+\centering
+\caption{Ablation results (350-step budget, evaluated on a shared 200-video validation subsample).}
+\label{tab:ablations}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Variant} & \textbf{Accuracy} & \textbf{Precision (real)} & \textbf{Recall (real)} & \textbf{Final train loss} \\
+\midrule
+baseline       & 91.0\% & 100.0\% & 78.3\% & 12.09 \\
+single\_frame  & 91.0\% & 100.0\% & 78.3\% & 11.83 \\
+no\_contrastive& 91.0\% & 100.0\% & 78.3\% & 11.91 \\
+lower\_lr      & 89.0\% &  94.2\% & 78.3\% & 23.37 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The learning-rate ablation shows a clear, expected effect: at a 5x lower peak
+LR, the fixed 350-step budget is not enough to converge, leaving final
+training loss roughly double that of the other three variants and a
+corresponding drop in accuracy and real-class precision. This confirms the
+step budget itself is a meaningful constraint on these ablation results,
+not just a convenience.
+
+The \emph{single\_frame} and \emph{no\_contrastive} variants, by contrast,
+converged to \emph{exactly} the same classification accuracy, precision, and
+recall as the baseline, despite visibly different per-step loss values
+throughout training and, for
+\emph{single\_frame}, roughly 4.6x faster wall-clock training (5.5 s/step vs.
+25.1 s/step, since a single frame is far cheaper to encode than four). We do
+not read this as evidence that frame count and contrastive alignment have no
+effect on the model; rather, we consider it likely that (a) at only 350 steps
+and 200 evaluation videos, classification accuracy is not a sensitive enough
+metric to detect a difference this small, and (b) the classification decision
+may be dominated by per-frame, low-level artifacts (compression, resolution,
+lighting) that a single frame already captures, while temporal information
+and cross-modal alignment may matter more for the quality of the generated
+\emph{explanation} than for the binary classification decision itself. We
+flag this as a specific, motivated direction for future ablation work: repeat
+this comparison using generation-quality metrics (SemSim, ROUGE-L, BLEU-1) in
+addition to classification accuracy, and with a longer step budget and larger
+eval set to increase sensitivity. One immediate practical takeaway does hold
+regardless: single-frame training reaches the same classification accuracy at
+roughly 4.6x lower wall-clock cost, which is useful for fast iteration during
+hyperparameter search even if the final model should retain multiple frames
+for explanation quality.
+
+\subsection{Qualitative Explanation Generation}
+
+Representative generated explanations, sampled periodically during training
+against held-out examples, are shown below.
+
+\begin{quote}
+\textit{Ground truth}: ``This video is FAKE. Micro-expressions are absent; the
+face shows only coarse motion without fine muscle detail. The face appears to
+lag behind the head motion by one or two frames.''\\
+\textit{Generated}: ``This video is FAKE. The face has an unnaturally uniform
+skin tone without the natural micro-variation of real skin. Lighting direction
+on the face is inconsistent with the environmental light source.''
+\end{quote}
+
+The classification label and the specific artifact described agree with the
+ground truth here, though the generated explanation identifies a different
+artifact (skin tone / lighting) than the one a human annotator focused on
+(motion lag), which is expected given each is one plausible artifact among
+several present in a genuinely manipulated video.
+
+A small held-out qualitative test (4 videos, 2 real and 2 fake, evaluated with
+the fully fine-tuned model) gave a classification accuracy of 3/4 (75.0\%),
+average semantic similarity of 0.838, average ROUGE-L of 0.260, and average
+BLEU-1 of 0.392 between generated and ground-truth explanations. The one
+misclassification and two label-disagreement cases from this same test are
+examined in Section~\ref{sec:failure}.
+
+\section{Failure Analysis}
+\label{sec:failure}
+
+We examine the three non-trivial cases from the 4-video held-out qualitative
+test (Section~\ref{sec:results}) in more detail, since a 75\% accuracy result
+on so few videos is more informative as individual case studies than as a
+single aggregate number.
+
+\paragraph{Misclassified real video.} On \texttt{train\_real\_5983.mp4} (ground
+truth REAL), the classification head predicted FAKE with 82.0\% confidence ---
+the one classification error in this test set. The generated explanation for
+this video also contained a malformed label token: it began ``This video is
+FEARFUL!'' rather than a well-formed REAL/FAKE judgment. We do not have enough
+occurrences of this token corruption to characterize it statistically, but its
+co-occurrence with the one classification error in this small test is worth
+noting: it may indicate the model was in a genuinely uncertain state on this
+example (consistent with the classification head's own 82.0\% rather than
+higher confidence), where both heads produced lower-quality output together,
+rather than the two failures being independent.
+
+\paragraph{Classification/generation label disagreement.} In 2 of the 4 test
+videos, the classification head's predicted label and the label stated in the
+first sentence of the \emph{generated explanation text} disagreed with each
+other, even though the classification head's prediction was itself correct in
+both cases. On \texttt{train\_1281.mp4} (ground truth FAKE), the classification
+head correctly predicted FAKE with 92.6\% confidence, but the generated
+explanation began ``This video is Real.'' A symmetric case occurred on
+\texttt{train\_real\_4670.flv} (ground truth REAL), where the classification
+head correctly predicted REAL with 70.7\% confidence, but the generated
+explanation began ``This video is FAKE.'' Unlike the misclassification above,
+these are cases where the \emph{classification head} got the right answer but
+the \emph{language-modeling head}'s stated label did not agree with it. This
+indicates that, at least on this small sample, the two heads can disagree on
+the surface label they each produce even when one of the two is correct --- a
+direct consequence of the two heads being trained with separate loss terms
+(Section~\ref{sec:method}) rather than any mechanism that enforces label
+agreement between them.
+
+\paragraph{Implication.} Together, these three cases point to the same
+underlying gap: nothing in the current training objective ties the
+classification head's decision to the label asserted by the generation head.
+A consistency loss (e.g.\ penalizing disagreement between the two heads'
+labels during training) or constrained decoding (forcing the generated label
+token to match the classification head's argmax at inference time) are both
+direct, implementable responses to this finding, and we list both as concrete
+future work in Section~\ref{sec:conclusion}.
+
+\section{Limitations}
+\label{sec:limitations}
+
+Several limitations should be noted. First, training used a reduced per-clip
+frame count relative to what full-video temporal analysis would ideally use,
+a direct consequence of memory and throughput constraints on the available
+hardware. Second, the model lacks the spatial click-localization supervision
+used by \citet{hondru2025exddv}, meaning it can describe but not point to a
+specific image region; extending the architecture with a grounding head is a
+natural direction for future work. Third, the classification head and the
+generation head can disagree on the label each produces even when one is
+correct, and a small number of generated explanations contained malformed
+label tokens; see Section~\ref{sec:failure} for a detailed analysis of both
+issues. Finally, results reported in Section~\ref{sec:results} reflect
+training on a compiled multi-source dataset rather than a single canonical
+benchmark, which should be considered when comparing against results reported
+on FaceForensics++ or Celeb-DF alone.
+
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+This project demonstrates that a compact, 256M-parameter vision-language model
+can be adapted via parameter-efficient fine-tuning into a functioning
+multi-task deepfake detector, jointly producing a classification decision and
+a natural-language justification, under meaningfully constrained compute and
+storage conditions. Beyond the modeling contribution, the project surfaced an
+engineering finding we consider independently useful: a checkpoint- and
+cache-persistent training pipeline substantially changes the practical
+feasibility of long training runs on interruptible infrastructure. Future
+work includes extending
+supervision with spatial artifact localization following
+\citet{hondru2025exddv}, adding a consistency loss or constrained decoding to
+close the classification/generation label-disagreement gap identified in
+Section~\ref{sec:failure}, evaluating cross-dataset generalization (training on
+this compiled corpus and testing on a held-out canonical benchmark such as
+FaceForensics++ alone), and scaling to the 500M or 2.2B SmolVLM2 variants once
+additional compute is available.
+
+
+\begin{thebibliography}{9}
+
+\bibitem[Cao et al.(2014)]{cao2014cremad}
+Cao, H., Cooper, D. G., Keutmann, M. K., Gur, R. C., Nenkova, A., \& Verma, R. (2014).
+CREMA-D: Crowd-sourced emotional multimodal actors dataset.
+\textit{IEEE Transactions on Affective Computing}, 5(4), 377--390.
+
+\bibitem[Hondru et al.(2025)]{hondru2025exddv}
+Hondru, V., Hogea, E., Onchis, D., \& Ionescu, R. T. (2025).
+ExDDV: A new dataset for explainable deepfake detection in video.
+\textit{arXiv preprint arXiv:2503.14421}. (Accepted at WACV 2026.)
+
+\bibitem[Hu et al.(2021)]{hu2021lora}
+Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., \& Chen, W. (2021).
+LoRA: Low-rank adaptation of large language models.
+\textit{arXiv preprint arXiv:2106.09685}.
+
+\bibitem[Li et al.(2020)]{li2020celebdf}
+Li, Y., Yang, X., Sun, P., Qi, H., \& Lyu, S. (2020).
+Celeb-DF: A large-scale challenging dataset for deepfake forensics.
+In \textit{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 3207--3216.
+
+\bibitem[Marafioti et al.(2025)]{marafioti2025smolvlm}
+Marafioti, A., Zohar, O., Farr\'e, M., Noyan, M., et al. (2025).
+SmolVLM: Redefining small and efficient multimodal models.
+\textit{arXiv preprint arXiv:2504.05299}.
+
+\bibitem[R\"ossler et al.(2019)]{rossler2019faceforensics}
+R\"ossler, A., Cozzolino, D., Verdoliva, L., Riess, C., Thies, J., \& Nie{\ss}ner, M. (2019).
+FaceForensics++: Learning to detect manipulated facial images.
+In \textit{Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)}, 1--11.
+
+\bibitem[Unleashing(2026)]{unleashing2026vlsemantics}
+Unleashing vision-language semantics for deepfake video detection.
+\textit{arXiv preprint arXiv:2603.24454}, 2026.
+
+\end{thebibliography}
+
+\end{document}
