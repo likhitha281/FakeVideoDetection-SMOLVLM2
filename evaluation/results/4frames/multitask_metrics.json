@@ -1,0 +1,29 @@
+{
+  "frames": 4,
+  "test_total": 3465,
+  "classification": {
+    "evaluated": 3465,
+    "accuracy": 0.9301587301587302,
+    "balanced_accuracy": 0.9135714285714286,
+    "precision_fake": 0.8951018638925011,
+    "recall_fake": 1.0,
+    "f1_fake": 0.944647758462946,
+    "roc_auc": 0.9439626426841924
+  },
+  "lm": {
+    "evaluated": 3465,
+    "unknown": 0,
+    "accuracy": 0.9292929292929293,
+    "balanced_accuracy": 0.9128450363196126,
+    "precision_fake": 0.8949652777777778,
+    "recall_fake": 0.998547215496368,
+    "f1_fake": 0.9439230945296406
+  },
+  "head_agreement": 0.9985569985569985,
+  "outcomes": {
+    "both_wrong": 241,
+    "classifier_only_correct": 4,
+    "both_correct": 3219,
+    "lm_only_correct": 1
+  }
+}

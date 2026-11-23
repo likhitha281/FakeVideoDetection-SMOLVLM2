@@ -26,3 +26,23 @@ exddv_frames/
 
 # OS
 .DS_Store
+
+# HPC / Slurm runtime
+logs/
+*.out
+*.err
+slurm-*.out
+
+# Hugging Face / model caches
+hf_cache/
+.cache/
+huggingface/
+
+# Local datasets — never commit video corpora
+dataset/
+datasets/
+DF40/
+df40_data/
+
+# Large/resumable inference artifacts
+evaluation/**/multitask_predictions.jsonl
